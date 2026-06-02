@@ -38,6 +38,7 @@ import matplotlib
 matplotlib.use("Agg")           # headless rendering — no display required
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import colour
 from colour import SpectralShape
 from colour.models import XYZ_to_Lab
@@ -45,8 +46,11 @@ from colour.models import XYZ_to_Lab
 
 # ── Configuration — edit these to change the search ───────────────────────────
 
-_HERE  = os.path.dirname(os.path.abspath(__file__))
-_STACK = os.path.join(_HERE, "python", "stack")
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_STACK  = os.path.join(_HERE, "data", "materials")
+_OUTDIR     = os.path.join(_HERE, "output")
+_OUTDIR_CSV = os.path.join(_OUTDIR, "csv")
+_OUTDIR_PNG = os.path.join(_OUTDIR, "png")
 
 GLASS_FILE = os.path.join(_STACK, "glass-industr-2018-mat.csv")
 L1_FILE    = os.path.join(_STACK, "L1-Si3N4-mat.csv")
@@ -425,9 +429,63 @@ def save_color_figure(
     print(f"  Saved : {out_path}")
 
 
+# ── 3-D surface figures ───────────────────────────────────────────────────────
+
+def save_3d_figure(
+    d1_arr: np.ndarray,
+    d3_arr: np.ndarray,
+    T_Y: np.ndarray,
+    F_Y: np.ndarray,
+    G_Y: np.ndarray,
+    mask: np.ndarray,
+    d2: float,
+    out_path: str,
+) -> None:
+    """Save a 3-D surface plot of T_Y / F_Y / G_Y over the d1×d3 grid.
+
+    Passing designs are marked as red scatter points on each surface.
+    """
+    D1, D3 = np.meshgrid(d1_arr, d3_arr, indexing="ij")
+
+    fig = plt.figure(figsize=(18, 6))
+    fig.suptitle(f"Grid search — Ag L2 = {d2:.1f} nm", fontsize=11)
+
+    panels = [
+        (T_Y, "Tvis (Y%)", "viridis"),
+        (F_Y, "Fvis (Y%)", "plasma"),
+        (G_Y, "Gvis (Y%)", "cividis"),
+    ]
+
+    i1_idx, i3_idx = np.where(mask)
+
+    for col, (Z, zlabel, cmap) in enumerate(panels):
+        ax = fig.add_subplot(1, 3, col + 1, projection="3d")
+        ax.plot_surface(D1, D3, Z, cmap=cmap, alpha=0.75,
+                        linewidth=0, antialiased=False, rstride=2, cstride=2)
+
+        if len(i1_idx):
+            ax.scatter(
+                d1_arr[i1_idx], d3_arr[i3_idx], Z[i1_idx, i3_idx],
+                color="red", s=8, depthshade=False, label="passing",
+            )
+
+        ax.set_xlabel("d1  (nm)", labelpad=6)
+        ax.set_ylabel("d3  (nm)", labelpad=6)
+        ax.set_zlabel(zlabel, labelpad=6)
+        ax.set_title(zlabel, fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved : {out_path}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    os.makedirs(_OUTDIR_CSV, exist_ok=True)
+    os.makedirs(_OUTDIR_PNG, exist_ok=True)
     print()
     print("═" * 60)
     print("  Low-E Coating Grid Search")
@@ -548,13 +606,17 @@ def main():
             )
 
         # ── Save CSV
-        csv_path = os.path.join(os.getcwd(), f"lowe_{tag}_passing.csv")
+        csv_path = os.path.join(_OUTDIR_CSV, f"lowe_{tag}_passing.csv")
         df.to_csv(csv_path, index=False, float_format="%.4f")
         print(f"\n  Saved : {csv_path}  ({n_pass} rows)")
 
         # ── Save color-patch PNG
-        png_path = os.path.join(os.getcwd(), f"lowe_{tag}_top{TOP_N}_colors.png")
+        png_path = os.path.join(_OUTDIR_PNG, f"lowe_{tag}_top{TOP_N}_colors.png")
         save_color_figure(df, d2, TOP_N, png_path)
+
+        # ── Save 3-D surface figure
+        fig3d_path = os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d.png")
+        save_3d_figure(D1_RANGE, D3_RANGE, T_Y, F_Y, G_Y, mask, d2, fig3d_path)
 
         # ── Collect best design for cross-Ag summary
         best = df.iloc[0]
@@ -569,8 +631,8 @@ def main():
         summary = pd.DataFrame(all_summary_rows)
         print(summary[["d2", "d1", "d3", "T_Y", "T_a", "T_b",
                         "F_Y", "F_a", "F_b", "G_Y", "G_a", "G_b"]].to_string(index=False))
-        summary.to_csv("lowe_best_per_Ag.csv", index=False, float_format="%.4f")
-        print("\nSaved : lowe_best_per_Ag.csv")
+        summary.to_csv(os.path.join(_OUTDIR_CSV, "lowe_best_per_Ag.csv"), index=False, float_format="%.4f")
+        print(f"\nSaved : {os.path.join(_OUTDIR_CSV, 'lowe_best_per_Ag.csv')}")
 
     print("\nDone.\n")
 
