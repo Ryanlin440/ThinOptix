@@ -30,8 +30,10 @@ from scipy.optimize import differential_evolution, minimize
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_HERE  = os.path.dirname(os.path.abspath(__file__))
-_STACK = os.path.join(_HERE, "python", "stack")
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_STACK  = os.path.join(_HERE, "data", "materials")
+_OUTDIR     = os.path.join(_HERE, "output")
+_OUTDIR_CSV = os.path.join(_OUTDIR, "csv")
 
 DEFAULTS: dict = dict(
     glass    = "glass-industr-2018-mat.csv",
@@ -413,6 +415,7 @@ def _load_materials():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    os.makedirs(_OUTDIR_CSV, exist_ok=True)
     print()
     print("═" * 60)
     print("  Optical Coating Design Tool  (WVASE simplified replacement)")
@@ -445,7 +448,7 @@ def main():
 
         print("\n── Output ───────────────────────────────────────────────────────────")
         out_base = _ask("Output filename base", DEFAULTS["out"])
-        out_path = os.path.join(os.getcwd(), out_base)
+        out_path = os.path.join(_OUTDIR_CSV, out_base)
 
         print(f"\n  Calculating (d1={d1:.1f} nm, d2={d2:.1f} nm, d3={d3:.1f} nm)…",
               flush=True)
@@ -465,7 +468,7 @@ def main():
 
         print("\n── Output ───────────────────────────────────────────────────────────")
         out_base = _ask("Output filename base", DEFAULTS["out"])
-        out_path = os.path.join(os.getcwd(), out_base)
+        out_path = os.path.join(_OUTDIR_CSV, out_base)
 
         print(f"\n  Optimising d1, d3  (L2 Ag = {L2_FIXED_NM:.0f} nm fixed)…\n")
         result = optimise_thicknesses(
