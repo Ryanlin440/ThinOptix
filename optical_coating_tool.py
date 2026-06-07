@@ -27,13 +27,19 @@ from colour import SpectralDistribution, SpectralShape
 from colour.colorimetry import sd_to_XYZ
 from colour.models import XYZ_to_Lab
 from scipy.optimize import differential_evolution, minimize
+import re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_STACK  = os.path.join(_HERE, "data", "materials")
+_HERE       = os.path.dirname(os.path.abspath(__file__))
+_STACK      = os.path.join(_HERE, "data", "materials")
+_DATA       = os.path.join(_HERE, "data")
 _OUTDIR     = os.path.join(_HERE, "output")
 _OUTDIR_CSV = os.path.join(_OUTDIR, "csv")
+_OUTDIR_PNG = os.path.join(_OUTDIR, "png")
 
 DEFAULTS: dict = dict(
     glass    = "glass-industr-2018-mat.csv",
@@ -54,11 +60,33 @@ ILLUMINANT = "D65"           # CIE illuminant for colour and Tvis calculation
 CMF_NAME   = "CIE 1931 2 Degree Standard Observer"
 VIS_SHAPE  = SpectralShape(380, 780, 1)
 
+# ── IGU / NFRC constants ───────────────────────────────────────────────────────
+_SIGMA      = 5.670374419e-8     # W/m²/K⁴  Stefan–Boltzmann
+_H_OUT_SHGC = 13.0              # W/m²K  exterior film, SHGC boundary conditions
+_H_IN_SHGC  = 7.7               # W/m²K  interior film, SHGC boundary conditions
+_K_GLASS    = 1.0               # W/m/K  glass thermal conductivity
+
+_GAS_K = {                       # thermal conductivities [W/m/K]
+    "argon": 0.0160, "ar": 0.0160,
+    "air":   0.0240,
+    "krypton": 0.0095, "kr": 0.0095,
+}
+
+IGU_DEFAULTS = dict(
+    solar_csv  = "E891AM1_5.csv",
+    glass2_csv = "glass-clear.csv",
+    glass1_mm  = 3.0,
+    glass2_mm  = 4.0,
+    gap_mm     = 12.0,
+    gas        = "90%Ar+10%air",
+    eps_normal = 0.02,
+)
+
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
 
 def _find(name: str) -> str:
-    for folder in (os.getcwd(), _HERE, _STACK):
+    for folder in (os.getcwd(), _HERE, _DATA, _STACK):
         p = os.path.join(folder, name)
         if os.path.isfile(p):
             return p
@@ -66,6 +94,7 @@ def _find(name: str) -> str:
         f"'{name}' not found.\n"
         f"  Searched: {os.getcwd()}\n"
         f"            {_HERE}\n"
+        f"            {_DATA}\n"
         f"            {_STACK}"
     )
 
@@ -390,6 +419,298 @@ def print_spectrum_summary(df: pd.DataFrame, tvis_w: np.ndarray):
         print(f"  {wl[idx]:>8.0f}  {T[idx]:7.2f}  {F[idx]:7.2f}  {G[idx]:7.2f}")
 
 
+# ── Spectra plot ──────────────────────────────────────────────────────────────
+
+def plot_tfg_spectra(spec_df: pd.DataFrame, out_png: str, title: str = "") -> None:
+    """Save a T/F/G vs wavelength PNG."""
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    wl = spec_df["wavelength"].values
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(wl, spec_df["T_percent"].values, label="T (transmission)",   color="#1f77b4", lw=1.8)
+    ax.plot(wl, spec_df["F_percent"].values, label="F (film-side R)",    color="#ff7f0e", lw=1.8)
+    ax.plot(wl, spec_df["G_percent"].values, label="G (glass-side R)",   color="#2ca02c", lw=1.8)
+    ax.axvspan(380, 780, color="gold", alpha=0.10, label="Visible (380–780 nm)")
+    ax.set_xlabel("Wavelength (nm)")
+    ax.set_ylabel("T / R (%)")
+    ax.set_xlim(wl[0], wl[-1])
+    ax.set_ylim(0, 100)
+    ax.legend(loc="upper right", fontsize=9)
+    if title:
+        ax.set_title(title, fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"  Saved spectra plot     : {out_png}")
+
+
+# ── IGU / NFRC functions ──────────────────────────────────────────────────────
+
+def _u_si_to_ip(u: float) -> float:
+    return u * 0.1761101838
+
+
+def _emissivity_n2h(e_n: float) -> float:
+    """Normal emissivity → hemispherical via bisection of the NFRC polynomial."""
+    def poly(eh):
+        return (-0.000393556 + 0.77769*eh + 0.36499*eh**2 + 5.10459*eh**3
+                - 31.73344*eh**4 + 96.50648*eh**5 - 186.00584*eh**6
+                + 232.53437*eh**7 - 167.73313*eh**8 + 51.35161*eh**9)
+    e_n = float(np.clip(e_n, 1e-6, 0.999999))
+    lo, hi = 1e-6, 0.999999
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if (poly(lo) - e_n) * (poly(mid) - e_n) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+
+def _load_solar(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load solar irradiance CSV → (wavelength_nm, irradiance)."""
+    df = pd.read_csv(path)
+    nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    wl_col, e_col = (nums[0], nums[1]) if len(nums) >= 2 else (df.columns[0], df.columns[1])
+    wl = df[wl_col].to_numpy(float)
+    E  = df[e_col].to_numpy(float)
+    mask = np.isfinite(wl) & np.isfinite(E)
+    wl, E = wl[mask], E[mask]
+    if wl.max() < 10:       # µm → nm
+        wl *= 1000.0
+    return wl, E
+
+
+def _clear_glass_TR(wl_nm: np.ndarray, n: np.ndarray, k: np.ndarray,
+                    t_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Incoherent T and R_eff for a plain glass slab."""
+    wl_m = wl_nm * 1e-9
+    nc = n + 1j * k
+    r = (nc - 1) / (nc + 1)
+    R = np.abs(r) ** 2
+    alpha = 4 * np.pi * k / wl_m
+    x = np.exp(-alpha * t_m)
+    T     = np.clip(((1 - R)**2 * x / (1 - R**2 * x**2)).astype(float), 0, 1)
+    R_eff = np.clip((R * (1 + (1 - R)**2 * x**2 / (1 - R**2 * x**2))).astype(float), 0, 1)
+    return T, R_eff
+
+
+def _igu_optics(T1, R1_front, R1_back, T2, R2):
+    """Incoherent two-pane IGU optics (gap multiple reflections)."""
+    den = np.where(np.abs(1 - R1_back * R2) < 1e-9, 1e-9, 1 - R1_back * R2)
+    T = np.clip(T1 * T2 / den,               0, 1)
+    R = np.clip(R1_front + T1**2 * R2 / den, 0, 1)
+    A = np.clip(1 - T - R,                   0, 1)
+    return T, R, A
+
+
+def _weighted_avg(wl, y, wl_min, wl_max, w_wl, w):
+    m = (wl >= wl_min) & (wl <= wl_max)
+    wl2, y2 = wl[m], y[m]
+    if wl2.size < 2:
+        return float("nan")
+    w2 = np.interp(wl2, w_wl, w, left=0.0, right=0.0)
+    num = float(np.trapezoid(y2 * w2, wl2))
+    den = float(np.trapezoid(w2, wl2))
+    return num / den if den > 0 else float("nan")
+
+
+def _cie_ybar_5nm() -> tuple[np.ndarray, np.ndarray]:
+    wl = np.arange(380, 781, 5, dtype=float)
+    ybar = np.array([
+        0.000040,0.000064,0.000120,0.000217,0.000396,0.000640,0.001210,0.002180,0.004000,0.007300,
+        0.011600,0.016840,0.023000,0.029800,0.038000,0.048000,0.060000,0.073900,0.091000,0.112600,
+        0.139000,0.169300,0.208000,0.258600,0.323000,0.407300,0.503000,0.608200,0.710000,0.793200,
+        0.862000,0.914850,0.954000,0.980300,0.995000,1.000000,0.995000,0.978600,0.952000,0.915400,
+        0.870000,0.816300,0.757000,0.694900,0.631000,0.566800,0.503000,0.441200,0.381000,0.321000,
+        0.265000,0.217000,0.175000,0.138200,0.107000,0.081600,0.061000,0.044580,0.032000,0.023200,
+        0.017000,0.011920,0.008210,0.005723,0.004102,0.002929,0.002091,0.001484,0.001047,0.000740,
+        0.000520,0.000361,0.000249,0.000172,0.000120,0.000085,0.000060,0.000042,0.000030,0.000021,
+        0.000015
+    ], dtype=float)
+    return wl, ybar
+
+
+def _parse_gas(spec: str) -> dict[str, float]:
+    """Parse a gas mix string like '90%Ar+10%air' into {name: fraction}."""
+    s = (spec or "").strip().lower().replace(" ", "")
+    if not s:
+        return {"argon": 1.0}
+
+    def norm(g: str) -> str:
+        return {"ar": "argon", "kr": "krypton"}.get(g, g)
+
+    if s in _GAS_K:
+        return {norm(s): 1.0}
+
+    mix: dict[str, float] = {}
+    for p in re.split(r"[+;,]", s):
+        m = re.match(r"^([0-9]*\.?[0-9]+)%([a-z]+)$", p)
+        if m:
+            mix[norm(m.group(2))] = mix.get(norm(m.group(2)), 0.0) + float(m.group(1)) / 100
+            continue
+        m = re.match(r"^([a-z]+):([0-9]*\.?[0-9]+)$", p)
+        if m:
+            mix[norm(m.group(1))] = mix.get(norm(m.group(1)), 0.0) + float(m.group(2))
+            continue
+        m = re.match(r"^([a-z]+)([0-9]*\.?[0-9]+)$", p)
+        if m:
+            mix[norm(m.group(1))] = mix.get(norm(m.group(1)), 0.0) + float(m.group(2))
+    if not mix:
+        return {"argon": 1.0}
+    total = sum(mix.values())
+    return {k: v / total for k, v in mix.items()} if total > 0 else {"argon": 1.0}
+
+
+def _k_gas(spec: str) -> float:
+    return sum(_GAS_K.get(g, _GAS_K["argon"]) * x for g, x in _parse_gas(spec).items())
+
+
+def _h_rad_gap(eps2_h: float, eps3_h: float, Tm: float) -> float:
+    den = max(1 / eps2_h + 1 / eps3_h - 1, 1e-9)
+    return 4 * _SIGMA * Tm**3 / den
+
+
+def _calc_u(t1_m, t2_m, gap_m, gas, eps2_n, eps3_h=0.89,
+            h_in=8.0, h_out=25.0, Nu_eff=1.135, Tm=293.15):
+    eps2_h = _emissivity_n2h(eps2_n)
+    kg = _k_gas(gas)
+    h_c = Nu_eff * kg / gap_m
+    h_r = _h_rad_gap(eps2_h, eps3_h, Tm)
+    h_gap = h_c + h_r
+    R = (1/h_out + t1_m/_K_GLASS + 1/h_gap + t2_m/_K_GLASS + 1/h_in)
+    U = 1.0 / R
+    return U, h_gap, eps2_h, kg
+
+
+def _inward_frac(side: str, t_m: float, gap_m: float, h_gap: float,
+                 h_in: float, h_out: float) -> float:
+    R_half = (t_m / 2) / _K_GLASS
+    Rg     = t_m / _K_GLASS
+    Ri, Ro = 1 / h_in, 1 / h_out
+    Rgap   = 1 / h_gap
+    if side == "outer":
+        R_out = R_half + Ro
+        R_in  = R_half + Rgap + Rg + Ri
+    else:
+        R_in  = R_half + Ri
+        R_out = R_half + Rgap + Rg + Ro
+    return R_out / (R_in + R_out)
+
+
+# ── Combined IGU interactive step ─────────────────────────────────────────────
+
+def run_igu_calculation(spec_df: pd.DataFrame, wl: np.ndarray, out_base: str) -> None:
+    """Prompt for IGU parameters, compute NFRC-style performance, print and save."""
+    print("\n── IGU / NFRC Performance ──────────────────────────────────────────────")
+    run = input("  Run IGU/NFRC calculation? [y/N]: ").strip().lower()
+    if run not in ("y", "yes"):
+        return
+
+    print("\n  Data files:")
+    solar_path  = _ask_file("  Solar spectrum CSV", IGU_DEFAULTS["solar_csv"])
+    glass2_path = _ask_file("  Clear glass CSV   ", IGU_DEFAULTS["glass2_csv"])
+
+    print("\n  IGU configuration:")
+    glass1_mm = _ask_float("  Coated pane thickness  (mm)", IGU_DEFAULTS["glass1_mm"])
+    glass2_mm = _ask_float("  Clear pane thickness   (mm)", IGU_DEFAULTS["glass2_mm"])
+    gap_mm    = _ask_float("  Gap thickness          (mm)", IGU_DEFAULTS["gap_mm"])
+    gas_spec  = _ask(      "  Gap gas spec              ", IGU_DEFAULTS["gas"])
+    eps_n     = _ask_float("  Coating normal emissivity ", IGU_DEFAULTS["eps_normal"])
+    eps_n     = float(np.clip(eps_n, 1e-6, 0.999999))
+
+    # ── coated pane spectra (T=transmission, F=film-side R, G=glass-side R) ──
+    T1    = spec_df["T_percent"].values / 100.0
+    R1_f  = spec_df["F_percent"].values / 100.0   # film-side R (faces gap)
+    R1_g  = spec_df["G_percent"].values / 100.0   # glass-side R (faces outside)
+
+    # ── clear glass pane ──────────────────────────────────────────────────────
+    g2_df = load_nk(glass2_path)
+    n2 = np.interp(wl, g2_df["wavelength"].values, g2_df["n"].values)
+    k2 = np.interp(wl, g2_df["wavelength"].values, g2_df["k"].values)
+    T2, R2 = _clear_glass_TR(wl, n2, k2, glass2_mm * 1e-3)
+
+    # coating on surface #2 (inner face of outer pane, gap side)
+    # outside → R1_g; gap side → R1_f
+    T_iu, R_iu, A_iu = _igu_optics(T1, R1_g, R1_f, T2, R2)
+
+    # ── solar weighting ────────────────────────────────────────────────────────
+    sw_wl, sw_E = _load_solar(solar_path)
+    Tsol = _weighted_avg(wl, T_iu, 300, 2500, sw_wl, sw_E)
+    Rsol = _weighted_avg(wl, R_iu, 300, 2500, sw_wl, sw_E)
+    Asol = 1.0 - Tsol - Rsol
+
+    # ── visible (IGU) ─────────────────────────────────────────────────────────
+    v_wl, v_yb = _cie_ybar_5nm()
+    VT_iu = _weighted_avg(wl, T_iu, 380, 780, v_wl, v_yb)
+
+    # ── thermal: U-value ──────────────────────────────────────────────────────
+    U_si, h_gap, eps2_h, kg = _calc_u(
+        glass1_mm * 1e-3, glass2_mm * 1e-3, gap_mm * 1e-3,
+        gas_spec, eps_n,
+    )
+    U_ip = _u_si_to_ip(U_si)
+
+    # ── SHGC (approximate inward-fraction method) ─────────────────────────────
+    f_o  = _inward_frac("outer", glass1_mm * 1e-3, gap_mm * 1e-3, h_gap, _H_IN_SHGC, _H_OUT_SHGC)
+    f_i  = _inward_frac("inner", glass1_mm * 1e-3, gap_mm * 1e-3, h_gap, _H_IN_SHGC, _H_OUT_SHGC)
+    SHGC = Tsol + Asol * 0.99 * f_o + Asol * 0.01 * f_i
+    LSG  = VT_iu / SHGC if SHGC > 0 else float("nan")
+
+    # ── monolithic pane: CIE Lab + absorption ─────────────────────────────────
+    TY, _, Ta, Tb = cie_lab(wl, spec_df["T_percent"].values)
+    FY, _, Fa, Fb = cie_lab(wl, spec_df["F_percent"].values)
+    GY, _, Ga, Gb = cie_lab(wl, spec_df["G_percent"].values)
+    absorb_pct = 100.0 - TY - FY   # T + F + Abs = 100% for single pane
+
+    # ── print combined summary ─────────────────────────────────────────────────
+    W = 62
+    bar = "─" * W
+    print()
+    print(f"  ┌{bar}┐")
+    print(f"  │  {'Monolithic coated glass':<{W-2}}│")
+    print(f"  ├{'─'*16}┬{'─'*11}┬{'─'*11}┬{'─'*11}┬{'─'*(W-52)}┤")
+    print(f"  │  {'Spectrum':<14}│{'Y':>10} │{'a*':>10} │{'b*':>10} │{'':<{W-52}}│")
+    print(f"  ├{'─'*16}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*(W-52)}┤")
+    print(f"  │  {'T':<14}│{TY:10.2f} │{Ta:10.2f} │{Tb:10.2f} │{'':<{W-52}}│")
+    print(f"  │  {'G':<14}│{GY:10.2f} │{Ga:10.2f} │{Gb:10.2f} │{'':<{W-52}}│")
+    print(f"  │  {'F':<14}│{FY:10.2f} │{Fa:10.2f} │{Fb:10.2f} │{'':<{W-52}}│")
+    print(f"  ├{'─'*16}┴{'─'*11}┴{'─'*11}┴{'─'*11}┴{'─'*(W-52)}┤")
+    print(f"  │  Absorption  (= 100% − T_Y − F_Y) = {absorb_pct:6.2f}%{'':<{W-43}}│")
+    print(f"  │  Emissivity  (normal)               εn = {eps_n:.3f}{'':<{W-47}}│")
+    print(f"  ├{bar}┤")
+    print(f"  │  IGU: {glass1_mm:.0f} mm coated / {gap_mm:.0f} mm [{gas_spec}] / {glass2_mm:.0f} mm clear", end="")
+    print(" " * max(0, W - len(f"  IGU: {glass1_mm:.0f} mm coated / {gap_mm:.0f} mm [{gas_spec}] / {glass2_mm:.0f} mm clear") + 2) + "│")
+    print(f"  ├{bar}┤")
+    print(f"  │  Tvis          {VT_iu*100:6.1f}%{'':<{W-23}}│")
+    print(f"  │  Tsol          {Tsol*100:6.1f}%{'':<{W-23}}│")
+    print(f"  │  U-value       {U_si:6.3f} W/m²K  ({U_ip:.3f} BTU/hr·ft²·°F){'':<{W-47}}│")
+    print(f"  │  SHGC          {SHGC*100:6.1f}%{'':<{W-23}}│")
+    print(f"  │  LSG           {LSG:6.2f}{'':<{W-22}}│")
+    print(f"  └{bar}┘")
+    print()
+
+    # ── save IGU CSV ──────────────────────────────────────────────────────────
+    igue_path = out_base + "_IGU.csv"
+    pd.DataFrame({
+        "param": ["T_Y","T_a*","T_b*","G_Y","G_a*","G_b*","F_Y","F_a*","F_b*",
+                  "absorption_%","eps_normal",
+                  "Tvis_IGU_%","Tsol_%","U_SI","U_IP","SHGC_%","LSG",
+                  "gas_k_eff","eps2_hemi"],
+        "value": [TY, Ta, Tb, GY, Ga, Gb, FY, Fa, Fb,
+                  absorb_pct, eps_n,
+                  VT_iu*100, Tsol*100, U_si, U_ip, SHGC*100, LSG,
+                  kg, eps2_h],
+    }).to_csv(igue_path, index=False, float_format="%.4f")
+    print(f"  Saved IGU results CSV  : {igue_path}")
+
+    # ── spectra PNG ───────────────────────────────────────────────────────────
+    os.makedirs(_OUTDIR_PNG, exist_ok=True)
+    png_name = os.path.basename(out_base) + "_TFG.png"
+    png_path = os.path.join(_OUTDIR_PNG, png_name)
+    plot_tfg_spectra(spec_df, png_path)
+
+
 # ── Material loading (interactive) ────────────────────────────────────────────
 
 def _load_materials():
@@ -457,6 +778,7 @@ def main():
         print_spectrum_summary(df, tvis_w)
         color_rows = print_color_table(df)
         save_results(out_path, df, color_rows)
+        run_igu_calculation(df, wl, out_path)
 
     # ── Mode 2: optimisation ──────────────────────────────────────────────────
     else:
@@ -498,6 +820,7 @@ def main():
         print_spectrum_summary(df, tvis_w)
         color_rows = print_color_table(df)
         save_results(out_path, df, color_rows)
+        run_igu_calculation(df, wl, out_path)
 
     print("\nDone.\n")
 

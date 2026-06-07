@@ -431,54 +431,202 @@ def save_color_figure(
 
 # ── 3-D surface figures ───────────────────────────────────────────────────────
 
-def save_3d_figure(
+def save_3d_tvis_figure(
     d1_arr: np.ndarray,
     d3_arr: np.ndarray,
     T_Y: np.ndarray,
-    F_Y: np.ndarray,
-    G_Y: np.ndarray,
+    mask: np.ndarray,
+    best_d1: float,
+    best_d3: float,
+    best_tvis: float,
+    d2: float,
+    out_path: str,
+) -> None:
+    """3-D Tvis surface with all passing designs and the best design highlighted."""
+    D1, D3 = np.meshgrid(d1_arr, d3_arr, indexing="ij")
+    i1, i3 = np.where(mask)
+
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    surf = ax.plot_surface(D1, D3, T_Y, cmap="viridis", alpha=0.82,
+                           linewidth=0, antialiased=True, rstride=2, cstride=2)
+    cbar = fig.colorbar(surf, ax=ax, shrink=0.50, pad=0.08)
+    cbar.set_label("Tvis (%)", fontsize=9)
+
+    if len(i1):
+        ax.scatter(d1_arr[i1], d3_arr[i3], T_Y[i1, i3],
+                   color="tomato", s=14, depthshade=True,
+                   label=f"passing  (n={len(i1)})", zorder=5)
+
+    ax.scatter([best_d1], [best_d3], [best_tvis],
+               color="gold", s=200, marker="*", depthshade=False,
+               edgecolors="k", linewidths=0.7,
+               label=f"best  Tvis = {best_tvis:.2f}%\nd1={best_d1:.0f} nm  d3={best_d3:.0f} nm",
+               zorder=10)
+
+    ax.set_xlabel("d1 – L1 (nm)", labelpad=9, fontsize=9)
+    ax.set_ylabel("d3 – L3 (nm)", labelpad=9, fontsize=9)
+    ax.set_zlabel("Tvis (%)",      labelpad=9, fontsize=9)
+    ax.set_title(f"Visible Transmission  |  Ag L2 = {d2:.1f} nm", fontsize=11, pad=14)
+    ax.view_init(elev=28, azim=225)
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.75)
+    ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved : {out_path}")
+
+
+def save_3d_color_figure(
+    d1_arr: np.ndarray,
+    d3_arr: np.ndarray,
+    T_lab: np.ndarray,
+    F_lab: np.ndarray,
+    G_lab: np.ndarray,
     mask: np.ndarray,
     d2: float,
     out_path: str,
 ) -> None:
-    """Save a 3-D surface plot of T_Y / F_Y / G_Y over the d1×d3 grid.
+    """2 × 3 grid of 3-D surfaces for Ta*, Tb*, Fa*, Fb*, Ga*, Gb*.
 
-    Passing designs are marked as red scatter points on each surface.
+    Translucent horizontal planes mark the spec min/max limits.
+    Red dots show where designs pass ALL constraints simultaneously.
     """
     D1, D3 = np.meshgrid(d1_arr, d3_arr, indexing="ij")
-
-    fig = plt.figure(figsize=(18, 6))
-    fig.suptitle(f"Grid search — Ag L2 = {d2:.1f} nm", fontsize=11)
+    i1, i3 = np.where(mask)
 
     panels = [
-        (T_Y, "Tvis (Y%)", "viridis"),
-        (F_Y, "Fvis (Y%)", "plasma"),
-        (G_Y, "Gvis (Y%)", "cividis"),
+        ("Ta*", T_lab[..., 1], TA_MIN, TA_MAX, "PiYG"),
+        ("Tb*", T_lab[..., 2], TB_MIN, TB_MAX, "PuOr"),
+        ("Fa*", F_lab[..., 1], FA_MIN, FA_MAX, "PiYG"),
+        ("Fb*", F_lab[..., 2], FB_MIN, FB_MAX, "PuOr"),
+        ("Ga*", G_lab[..., 1], GA_MIN, GA_MAX, "PiYG"),
+        ("Gb*", G_lab[..., 2], GB_MIN, GB_MAX, "PuOr"),
     ]
 
-    i1_idx, i3_idx = np.where(mask)
+    fig = plt.figure(figsize=(22, 13))
+    fig.suptitle(
+        f"Color Parameter Landscape  |  Ag L2 = {d2:.1f} nm\n"
+        "Blue plane = spec lower limit  |  Red plane = spec upper limit  "
+        "|  Red dots = passing designs",
+        fontsize=11,
+    )
 
-    for col, (Z, zlabel, cmap) in enumerate(panels):
-        ax = fig.add_subplot(1, 3, col + 1, projection="3d")
-        ax.plot_surface(D1, D3, Z, cmap=cmap, alpha=0.75,
-                        linewidth=0, antialiased=False, rstride=2, cstride=2)
+    # Corner grids for limit planes (shared across subplots)
+    _xx = np.array([[d1_arr[0], d1_arr[-1]], [d1_arr[0], d1_arr[-1]]])
+    _yy = np.array([[d3_arr[0], d3_arr[0]], [d3_arr[-1], d3_arr[-1]]])
 
-        if len(i1_idx):
-            ax.scatter(
-                d1_arr[i1_idx], d3_arr[i3_idx], Z[i1_idx, i3_idx],
-                color="red", s=8, depthshade=False, label="passing",
-            )
+    for idx, (label, Z, zmin, zmax, cmap) in enumerate(panels):
+        ax = fig.add_subplot(2, 3, idx + 1, projection="3d")
 
-        ax.set_xlabel("d1  (nm)", labelpad=6)
-        ax.set_ylabel("d3  (nm)", labelpad=6)
-        ax.set_zlabel(zlabel, labelpad=6)
-        ax.set_title(zlabel, fontsize=9)
-        ax.tick_params(labelsize=7)
+        surf = ax.plot_surface(D1, D3, Z, cmap=cmap, alpha=0.78,
+                               linewidth=0, antialiased=True, rstride=2, cstride=2)
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.42, pad=0.08)
+        cbar.set_label(label, fontsize=8)
+
+        # Spec-limit planes
+        for zlim, col in [(zmin, "steelblue"), (zmax, "firebrick")]:
+            zz = np.full_like(_xx, float(zlim))
+            ax.plot_surface(_xx, _yy, zz, color=col, alpha=0.20, linewidth=0)
+
+        # Passing designs (all constraints met)
+        if len(i1):
+            ax.scatter(d1_arr[i1], d3_arr[i3], Z[i1, i3],
+                       color="red", s=7, depthshade=False, zorder=5)
+
+        ax.set_xlabel("d1 – L1 (nm)", labelpad=5, fontsize=7)
+        ax.set_ylabel("d3 – L3 (nm)", labelpad=5, fontsize=7)
+        ax.set_zlabel(label,           labelpad=5, fontsize=7)
+        ax.set_title(f"{label}   spec [{zmin}, {zmax}]", fontsize=9, pad=8)
+        ax.tick_params(labelsize=6)
+        ax.view_init(elev=28, azim=225)
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved : {out_path}")
+
+
+def print_trends_report(
+    d1_arr: np.ndarray,
+    d3_arr: np.ndarray,
+    T_Y: np.ndarray,
+    T_lab: np.ndarray,
+    F_lab: np.ndarray,
+    G_lab: np.ndarray,
+    mask: np.ndarray,
+    d2: float,
+) -> None:
+    """Compute Pearson correlations and print tuning guidance."""
+    N1, N3 = T_Y.shape
+    d1_flat = np.repeat(d1_arr[:, np.newaxis], N3, axis=1).ravel()
+    d3_flat = np.repeat(d3_arr[np.newaxis, :], N1, axis=0).ravel()
+
+    metrics = [
+        ("T_Y",  T_Y.ravel(),           None,    None),
+        ("Ta*",  T_lab[..., 1].ravel(), TA_MIN,  TA_MAX),
+        ("Tb*",  T_lab[..., 2].ravel(), TB_MIN,  TB_MAX),
+        ("Fa*",  F_lab[..., 1].ravel(), FA_MIN,  FA_MAX),
+        ("Fb*",  F_lab[..., 2].ravel(), FB_MIN,  FB_MAX),
+        ("Ga*",  G_lab[..., 1].ravel(), GA_MIN,  GA_MAX),
+        ("Gb*",  G_lab[..., 2].ravel(), GB_MIN,  GB_MAX),
+    ]
+
+    sep = "  " + "─" * 56
+    print(f"\n{sep}")
+    print(f"  TREND ANALYSIS  —  Ag L2 = {d2:.1f} nm")
+    print(sep)
+
+    # ── Full-grid Pearson correlations
+    print(f"\n  Full-grid Pearson ρ (all {N1*N3:,} thickness combinations):")
+    print(f"    {'Metric':>5}   ρ(d1-L1)   ρ(d3-L3)   dominant layer")
+    print("    " + "─" * 46)
+    corrs: dict[str, tuple[float, float]] = {}
+    for name, vals, _, _ in metrics:
+        r1 = float(np.corrcoef(d1_flat, vals)[0, 1])
+        r3 = float(np.corrcoef(d3_flat, vals)[0, 1])
+        corrs[name] = (r1, r3)
+        dom = "L1 (d1)" if abs(r1) >= abs(r3) else "L3 (d3)"
+        print(f"    {name:>5}    {r1:+.3f}      {r3:+.3f}      {dom}")
+
+    # ── Passing-design statistics
+    n_pass = int(mask.sum())
+    n_total = N1 * N3
+    print(f"\n  Passing designs: {n_pass:,} / {n_total:,}  ({100*n_pass/n_total:.1f}% of grid)")
+
+    if n_pass == 0:
+        print("  No passing designs — see correlation table for guidance.\n")
+        return
+
+    i1_p, i3_p = np.where(mask)
+    d1_p = d1_arr[i1_p];  d3_p = d3_arr[i3_p]
+    T_p  = T_Y[i1_p, i3_p]
+    bi   = int(np.argmax(T_p))
+
+    print(f"\n  Thickness range of passing designs:")
+    print(f"    d1 (L1 Si₃N₄) : {d1_p.min():.0f} – {d1_p.max():.0f} nm"
+          f"   mean {d1_p.mean():.1f} nm   σ {d1_p.std():.1f} nm")
+    print(f"    d3 (L3 ZrO₂)  : {d3_p.min():.0f} – {d3_p.max():.0f} nm"
+          f"   mean {d3_p.mean():.1f} nm   σ {d3_p.std():.1f} nm")
+    print(f"\n  Tvis across passing designs:")
+    print(f"    Best : {T_p.max():.2f}%  at  d1 = {d1_p[bi]:.0f} nm, d3 = {d3_p[bi]:.0f} nm")
+    print(f"    Mean : {T_p.mean():.2f}%     range [{T_p.min():.2f}%,  {T_p.max():.2f}%]")
+
+    # ── Directional guidance
+    _up   = "increases ↑"
+    _down = "decreases ↓"
+    print(f"\n  Tuning guidance (direction = full-grid trend):")
+    print(f"    {'Metric':>5}   thicker d1 (L1) →      thicker d3 (L3) →      spec")
+    print("    " + "─" * 66)
+    for name, _, lo, hi in metrics:
+        r1, r3 = corrs[name]
+        spec_str = f"[{lo}, {hi}]" if lo is not None else "—"
+        print(f"    {name:>5}   {(_up if r1>0 else _down):<20}   "
+              f"{(_up if r3>0 else _down):<20}   {spec_str}")
+
+    print()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -614,12 +762,25 @@ def main():
         png_path = os.path.join(_OUTDIR_PNG, f"lowe_{tag}_top{TOP_N}_colors.png")
         save_color_figure(df, d2, TOP_N, png_path)
 
-        # ── Save 3-D surface figure
-        fig3d_path = os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d.png")
-        save_3d_figure(D1_RANGE, D3_RANGE, T_Y, F_Y, G_Y, mask, d2, fig3d_path)
-
-        # ── Collect best design for cross-Ag summary
+        # ── Best design
         best = df.iloc[0]
+
+        # ── 3-D Tvis figure (best design highlighted)
+        save_3d_tvis_figure(
+            D1_RANGE, D3_RANGE, T_Y, mask,
+            best["d1"], best["d3"], best["T_Y"], d2,
+            os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d_Tvis.png"),
+        )
+
+        # ── 3-D colour-parameter figure (Ta*, Tb*, Fa*, Fb*, Ga*, Gb*)
+        save_3d_color_figure(
+            D1_RANGE, D3_RANGE, T_lab, F_lab, G_lab, mask, d2,
+            os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d_color.png"),
+        )
+
+        # ── Trend analysis report
+        print_trends_report(D1_RANGE, D3_RANGE, T_Y, T_lab, F_lab, G_lab, mask, d2)
+
         all_summary_rows.append(dict(best))
 
         print()
