@@ -30,6 +30,7 @@ Outputs per Ag thickness:
 
 from __future__ import annotations
 
+import glob
 import os
 import time
 import numpy as np
@@ -46,15 +47,17 @@ from colour.models import XYZ_to_Lab
 
 # ── Configuration — edit these to change the search ───────────────────────────
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_STACK  = os.path.join(_HERE, "data", "materials")
-_OUTDIR     = os.path.join(_HERE, "output")
-_OUTDIR_CSV = os.path.join(_OUTDIR, "csv")
-_OUTDIR_PNG = os.path.join(_OUTDIR, "png")
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+_STACK       = os.path.join(_HERE, "data", "materials")
+_EXPERIMENTS = os.path.join(_HERE, "data", "experiments")
+_OUTDIR      = os.path.join(_HERE, "output")
+_OUTDIR_CSV  = os.path.join(_OUTDIR, "csv")
+_OUTDIR_DESIGN  = os.path.join(_OUTDIR, "png", "design_space")
+_OUTDIR_3D      = os.path.join(_OUTDIR, "png", "3d_surfaces")
+_OUTDIR_PATCHES = os.path.join(_OUTDIR, "png", "color_patches")
 
 GLASS_FILE = os.path.join(_STACK, "glass-industr-2018-mat.csv")
 L1_FILE    = os.path.join(_STACK, "L1-Si3N4-mat.csv")
-L2_FILE    = os.path.join(_STACK, "L2-Ag-mat.csv")
 L3_FILE    = os.path.join(_STACK, "L3-top-ZrO2-mat.csv")
 
 GLASS_MM        = 3.0                      # glass substrate thickness (mm)
@@ -82,8 +85,18 @@ FB_MIN, FB_MAX = -15.0, -4.0
 
 # ── n,k loading ───────────────────────────────────────────────────────────────
 
+def read_label(path: str) -> str | None:
+    """Return the first line of a material file if it is not a CSV header."""
+    with open(path, encoding="utf-8-sig") as f:
+        first = f.readline().strip()
+    if "wavelength" in first.lower() or ("," in first and first.replace(",", "").replace(".", "").replace(" ", "").isalpha()):
+        return None
+    return first if first else None
+
+
 def load_nk(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    label = read_label(path)
+    df = pd.read_csv(path, skiprows=1 if label is not None else 0)
     df.columns = [str(c).strip() for c in df.columns]
     lo = {c.lower(): c for c in df.columns}
     wl_col = (
@@ -429,6 +442,60 @@ def save_color_figure(
     print(f"  Saved : {out_path}")
 
 
+# ── 2-D design-space map ─────────────────────────────────────────────────────
+
+def save_design_space_figure(
+    d1_arr: np.ndarray,
+    d3_arr: np.ndarray,
+    T_Y: np.ndarray,
+    mask: np.ndarray,
+    d2: float,
+    out_path: str,
+    best_d1: float | None = None,
+    best_d3: float | None = None,
+    best_tvis: float | None = None,
+    label: str | None = None,
+) -> None:
+    """2-D scatter of passing designs across d1/d3 grid."""
+    fig, ax = plt.subplots(figsize=(6, 7))
+
+    ax.set_xlim(10, 50)
+    ax.set_ylim(d3_arr[0], d3_arr[-1])
+
+    i1, i3 = np.where(mask)
+    if len(i1):
+        ax.scatter(d1_arr[i1], d3_arr[i3], s=14, color="tomato",
+                   label=f"passing (n={len(i1)})", zorder=3)
+        d1_p = d1_arr[i1];  d3_p = d3_arr[i3]
+        range_txt = (
+            f"L1 range: {d1_p.min():.0f}–{d1_p.max():.0f} nm\n"
+            f"L3 range: {d3_p.min():.0f}–{d3_p.max():.0f} nm"
+        )
+        ax.text(0.04, 0.97, range_txt, transform=ax.transAxes,
+                fontsize=22, va="top", family="monospace",
+                bbox=dict(boxstyle="round,pad=0.5", fc="white", alpha=0.9))
+    if best_d1 is not None:
+        ax.scatter([best_d1], [best_d3], s=350, marker="*", color="gold",
+                   edgecolors="k", linewidths=0.7,
+                   label=f"best\nL1 = {best_d1:.0f} nm\nL3 = {best_d3:.0f} nm\nTvis = {best_tvis:.2f}%",
+                   zorder=4)
+
+    ax.set_xlabel("L1 (nm)", fontsize=15)
+    ax.set_ylabel("L3 (nm)", fontsize=15)
+    ax.tick_params(labelsize=13)
+    title = f"{label}  —  L1 / L3 Design Space" if label else "L1 / L3 Design Space"
+    ax.set_title(title, fontsize=13)
+    if len(i1) or best_d1 is not None:
+        ax.legend(fontsize=16, loc="lower right", framealpha=0.9,
+                  markerscale=1.5, handlelength=1.5, labelspacing=1.2,
+                  borderpad=1.2)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved : {out_path}")
+
+
 # ── 3-D surface figures ───────────────────────────────────────────────────────
 
 def save_3d_tvis_figure(
@@ -632,168 +699,167 @@ def print_trends_report(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs(_OUTDIR_CSV, exist_ok=True)
-    os.makedirs(_OUTDIR_PNG, exist_ok=True)
+    for d in (_OUTDIR_CSV, _OUTDIR_DESIGN, _OUTDIR_3D, _OUTDIR_PATCHES, _EXPERIMENTS):
+        os.makedirs(d, exist_ok=True)
+
+    exp_files = sorted(glob.glob(os.path.join(_EXPERIMENTS, "*.csv")))
+    if not exp_files:
+        print(f"No experiment CSVs found in {_EXPERIMENTS}")
+        return
+
     print()
     print("═" * 60)
     print("  Low-E Coating Grid Search")
+    print(f"  Experiments found: {len(exp_files)}")
     print(f"  d1 (L1): {int(D1_RANGE[0])}–{int(D1_RANGE[-1])} nm  │"
           f"  d3 (L3): {int(D3_RANGE[0])}–{int(D3_RANGE[-1])} nm")
     print(f"  Ag L2 values: {AG_THICKNESSES} nm")
-    print(f"  Grid size: {len(D1_RANGE)}×{len(D3_RANGE)} = {len(D1_RANGE)*len(D3_RANGE):,} per Ag")
-    print(f"  Illuminant: {ILLUMINANT}  │  {CMF_NAME}")
     print("═" * 60)
 
-    # ── Load materials
-    print("\nLoading material n,k data…", end=" ", flush=True)
+    # ── Load fixed materials and CIE weights once
     wl = np.arange(WL_START, WL_END + 0.1, WL_STEP)
     glass_nk = interp_nk(load_nk(GLASS_FILE), wl)
     L1_nk    = interp_nk(load_nk(L1_FILE),    wl)
-    L2_nk    = interp_nk(load_nk(L2_FILE),    wl)
     L3_nk    = interp_nk(load_nk(L3_FILE),    wl)
-    print("done.")
 
-    # ── Precompute CIE colour weights
-    print("Precomputing CIE colour weights…", end=" ", flush=True)
-    xyz_w = _build_xyz_weights(wl)                    # (NW, 3), normalised
-    XYZ_n = xyz_w.sum(axis=0)                         # white-point XYZ fractions
-    print(f"done  (D65 XYZ_n = [{XYZ_n[0]*100:.2f}, {XYZ_n[1]*100:.2f}, {XYZ_n[2]*100:.2f}])")
+    xyz_w = _build_xyz_weights(wl)
+    XYZ_n = xyz_w.sum(axis=0)
+    yw    = xyz_w[:, 1]
 
-    # ── Constraint-summary header
+    all_summary_rows = []
+
+    # ── Phase 1: compute all grids and collect results
+    print("\nComputing grids…")
+    computed = []   # list of result dicts, one per (experiment, d2)
+    for exp_file in exp_files:
+        label   = read_label(exp_file) or os.path.splitext(os.path.basename(exp_file))[0]
+        safe_id = label.replace(" ", "_")
+        L2_nk   = interp_nk(load_nk(exp_file), wl)
+
+        for d2 in AG_THICKNESSES:
+            ag_tag = f"Ag{d2:.4g}nm"
+            t0 = time.perf_counter()
+            print(f"  {label}  {ag_tag}…", end=" ", flush=True)
+
+            T_spec, F_spec, G_spec = calculate_tfg_grid(
+                wl, glass_nk, L1_nk, L2_nk, L3_nk,
+                D1_RANGE, d2, D3_RANGE, GLASS_MM,
+            )
+            _, T_lab = compute_color_grid(T_spec, xyz_w, XYZ_n)
+            _, F_lab = compute_color_grid(F_spec, xyz_w, XYZ_n)
+            _, G_lab = compute_color_grid(G_spec, xyz_w, XYZ_n)
+
+            N1, N3, NW = T_spec.shape
+            T_Y = ((T_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100).reshape(N1, N3)
+            F_Y = ((F_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100).reshape(N1, N3)
+            G_Y = ((G_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100).reshape(N1, N3)
+            mask   = check_constraints(T_Y, F_Y, G_Y, T_lab, F_lab, G_lab)
+
+            print(f"done  ({time.perf_counter()-t0:.1f}s)  passing={int(mask.sum())}/{N1*N3:,}")
+            computed.append(dict(
+                label=label, safe_id=safe_id, d2=d2, ag_tag=ag_tag,
+                prefix=f"{safe_id}_{ag_tag}",
+                T_Y=T_Y, F_Y=F_Y, G_Y=G_Y,
+                T_lab=T_lab, F_lab=F_lab, G_lab=G_lab,
+                mask=mask,
+            ))
+
+    # ── Phase 2: generate all outputs
     print()
-    print("Constraints:")
-    print(f"  Fvis < {FVIS_MAX}%  |  Gvis < {GVIS_MAX}%")
-    print(f"  Ta* ∈ [{TA_MIN},{TA_MAX}]  Tb* ∈ [{TB_MIN},{TB_MAX}]")
-    print(f"  Ga* ∈ [{GA_MIN},{GA_MAX}]  Gb* ∈ [{GB_MIN},{GB_MAX}]")
-    print(f"  Fa* ∈ [{FA_MIN},{FA_MAX}]  Fb* ∈ [{FB_MIN},{FB_MAX}]")
-    print()
+    for exp_file in exp_files:
+        label   = read_label(exp_file) or os.path.splitext(os.path.basename(exp_file))[0]
+        safe_id = label.replace(" ", "_")
+        exp_results = [r for r in computed if r["label"] == label]
 
-    all_summary_rows = []   # for a combined summary CSV
+        print(f"┌─ Experiment: {label} " + "─" * max(0, 44 - len(label)))
+        for r in exp_results:
+            d2     = r["d2"]
+            prefix = r["prefix"]
+            T_Y    = r["T_Y"];  F_Y = r["F_Y"];  G_Y = r["G_Y"]
+            T_lab  = r["T_lab"]; F_lab = r["F_lab"]; G_lab = r["G_lab"]
+            mask   = r["mask"]
+            n_pass = int(mask.sum())
+            N1, N3 = T_Y.shape
 
-    for d2 in AG_THICKNESSES:
-        tag = f"Ag{d2:.1f}nm".replace(".", "p")
-        print(f"── Ag L2 = {d2:.1f} nm ─────────────────────────────────────────")
+            print(f"│  {r['ag_tag']}  passing={n_pass}/{N1*N3:,}")
 
-        # ── Compute T/F/G spectra for the full grid
-        t0 = time.perf_counter()
-        print(f"  Computing T/F/G for {len(D1_RANGE)}×{len(D3_RANGE)} grid…", end=" ", flush=True)
-        T_spec, F_spec, G_spec = calculate_tfg_grid(
-            wl, glass_nk, L1_nk, L2_nk, L3_nk,
-            D1_RANGE, d2, D3_RANGE, GLASS_MM,
-        )
-        print(f"done  ({time.perf_counter()-t0:.1f}s)")
+            if n_pass == 0:
+                print("│    No passing designs — skipping output.")
+                continue
 
-        # ── CIE colour for all grid points
-        print("  Computing CIE XYZ + Lab…", end=" ", flush=True)
-        _, T_lab = compute_color_grid(T_spec, xyz_w, XYZ_n)
-        _, F_lab = compute_color_grid(F_spec, xyz_w, XYZ_n)
-        _, G_lab = compute_color_grid(G_spec, xyz_w, XYZ_n)
-        print("done.")
+            # ── Collect passing designs
+            i1_idx, i3_idx = np.where(mask)
+            rows = []
+            for i1, i3 in zip(i1_idx, i3_idx):
+                rows.append({
+                    "d1":  D1_RANGE[i1], "d2": d2, "d3": D3_RANGE[i3],
+                    "T_Y": round(float(T_Y[i1, i3]), 4),
+                    "T_L": round(float(T_lab[i1, i3, 0]), 4),
+                    "T_a": round(float(T_lab[i1, i3, 1]), 4),
+                    "T_b": round(float(T_lab[i1, i3, 2]), 4),
+                    "F_Y": round(float(F_Y[i1, i3]), 4),
+                    "F_L": round(float(F_lab[i1, i3, 0]), 4),
+                    "F_a": round(float(F_lab[i1, i3, 1]), 4),
+                    "F_b": round(float(F_lab[i1, i3, 2]), 4),
+                    "G_Y": round(float(G_Y[i1, i3]), 4),
+                    "G_L": round(float(G_lab[i1, i3, 0]), 4),
+                    "G_a": round(float(G_lab[i1, i3, 1]), 4),
+                    "G_b": round(float(G_lab[i1, i3, 2]), 4),
+                })
+            df   = pd.DataFrame(rows).sort_values("T_Y", ascending=False).reset_index(drop=True)
+            best = df.iloc[0]
 
-        # Y (photopic) is just the L* channel mapped back: Y = XYZ[1]*100
-        # But easier: recompute Y directly from spectra @ xyz_w[:, 1]
-        N1, N3, NW = T_spec.shape
-        yw = xyz_w[:, 1]                                # (NW,) — Y-channel weight
-        T_Y = (T_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100   # %
-        F_Y = (F_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100
-        G_Y = (G_spec.reshape(N1*N3, NW) / 100.0) @ yw * 100
-        T_Y = T_Y.reshape(N1, N3)
-        F_Y = F_Y.reshape(N1, N3)
-        G_Y = G_Y.reshape(N1, N3)
+            # ── Console summary
+            print(f"\n│    Top {min(TOP_N, n_pass)} designs (sorted by Tvis ↓):")
+            hdr = (f"│    {'d1':>5} {'d3':>5}  "
+                   f"{'T_Y':>6} {'T_a':>6} {'T_b':>6}  "
+                   f"{'F_Y':>6} {'F_a':>6} {'F_b':>6}  "
+                   f"{'G_Y':>6} {'G_a':>6} {'G_b':>6}")
+            print(hdr)
+            for _, row in df.head(TOP_N).iterrows():
+                print(f"│    {row.d1:5.0f} {row.d3:5.0f}  "
+                      f"{row.T_Y:6.2f} {row.T_a:6.2f} {row.T_b:6.2f}  "
+                      f"{row.F_Y:6.2f} {row.F_a:6.2f} {row.F_b:6.2f}  "
+                      f"{row.G_Y:6.2f} {row.G_a:6.2f} {row.G_b:6.2f}")
+            print()
 
-        # ── Apply constraints
-        mask = check_constraints(T_Y, F_Y, G_Y, T_lab, F_lab, G_lab)
-        n_pass = int(mask.sum())
-        print(f"  Passing designs: {n_pass} / {N1*N3:,}")
+            # ── Save outputs
+            csv_path = os.path.join(_OUTDIR_CSV, f"{prefix}_passing_designs.csv")
+            df.to_csv(csv_path, index=False, float_format="%.4f")
+            print(f"│    Saved : {csv_path}  ({n_pass} rows)")
 
-        if n_pass == 0:
-            print("  No passing designs — skipping output.\n")
-            continue
+            save_color_figure(df, d2, TOP_N,
+                os.path.join(_OUTDIR_PATCHES, f"{prefix}_color_patches.png"))
 
-        # ── Collect passing designs into a DataFrame
-        i1_idx, i3_idx = np.where(mask)        # indices into D1_RANGE, D3_RANGE
-
-        rows = []
-        for i1, i3 in zip(i1_idx, i3_idx):
-            rows.append({
-                "d1":  D1_RANGE[i1],
-                "d2":  d2,
-                "d3":  D3_RANGE[i3],
-                "T_Y": round(float(T_Y[i1, i3]), 4),
-                "T_L": round(float(T_lab[i1, i3, 0]), 4),
-                "T_a": round(float(T_lab[i1, i3, 1]), 4),
-                "T_b": round(float(T_lab[i1, i3, 2]), 4),
-                "F_Y": round(float(F_Y[i1, i3]), 4),
-                "F_L": round(float(F_lab[i1, i3, 0]), 4),
-                "F_a": round(float(F_lab[i1, i3, 1]), 4),
-                "F_b": round(float(F_lab[i1, i3, 2]), 4),
-                "G_Y": round(float(G_Y[i1, i3]), 4),
-                "G_L": round(float(G_lab[i1, i3, 0]), 4),
-                "G_a": round(float(G_lab[i1, i3, 1]), 4),
-                "G_b": round(float(G_lab[i1, i3, 2]), 4),
-            })
-
-        df = pd.DataFrame(rows).sort_values("T_Y", ascending=False).reset_index(drop=True)
-
-        # ── Print top N to console
-        print(f"\n  Top {min(TOP_N, n_pass)} designs (sorted by Tvis ↓):")
-        header = (
-            f"  {'d1':>5} {'d3':>5}  "
-            f"{'T_Y':>6} {'T_L':>6} {'T_a':>6} {'T_b':>6}  "
-            f"{'F_Y':>6} {'F_a':>6} {'F_b':>6}  "
-            f"{'G_Y':>6} {'G_a':>6} {'G_b':>6}"
-        )
-        print(header)
-        print("  " + "─" * (len(header) - 2))
-        for _, r in df.head(TOP_N).iterrows():
-            print(
-                f"  {r.d1:5.0f} {r.d3:5.0f}  "
-                f"{r.T_Y:6.2f} {r.T_L:6.2f} {r.T_a:6.2f} {r.T_b:6.2f}  "
-                f"{r.F_Y:6.2f} {r.F_a:6.2f} {r.F_b:6.2f}  "
-                f"{r.G_Y:6.2f} {r.G_a:6.2f} {r.G_b:6.2f}"
+            save_design_space_figure(
+                D1_RANGE, D3_RANGE, T_Y, mask, d2,
+                os.path.join(_OUTDIR_DESIGN, f"{prefix}_design_space.png"),
+                best_d1=best["d1"], best_d3=best["d3"], best_tvis=best["T_Y"],
+                label=label,
             )
 
-        # ── Save CSV
-        csv_path = os.path.join(_OUTDIR_CSV, f"lowe_{tag}_passing.csv")
-        df.to_csv(csv_path, index=False, float_format="%.4f")
-        print(f"\n  Saved : {csv_path}  ({n_pass} rows)")
+            save_3d_tvis_figure(
+                D1_RANGE, D3_RANGE, T_Y, mask,
+                best["d1"], best["d3"], best["T_Y"], d2,
+                os.path.join(_OUTDIR_3D, f"{prefix}_transmission_surface.png"),
+            )
 
-        # ── Save color-patch PNG
-        png_path = os.path.join(_OUTDIR_PNG, f"lowe_{tag}_top{TOP_N}_colors.png")
-        save_color_figure(df, d2, TOP_N, png_path)
+            save_3d_color_figure(
+                D1_RANGE, D3_RANGE, T_lab, F_lab, G_lab, mask, d2,
+                os.path.join(_OUTDIR_3D, f"{prefix}_color_surface.png"),
+            )
 
-        # ── Best design
-        best = df.iloc[0]
+            print_trends_report(D1_RANGE, D3_RANGE, T_Y, T_lab, F_lab, G_lab, mask, d2)
+            all_summary_rows.append({"experiment": label, **dict(best)})
 
-        # ── 3-D Tvis figure (best design highlighted)
-        save_3d_tvis_figure(
-            D1_RANGE, D3_RANGE, T_Y, mask,
-            best["d1"], best["d3"], best["T_Y"], d2,
-            os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d_Tvis.png"),
-        )
+        print("└" + "─" * 58)
 
-        # ── 3-D colour-parameter figure (Ta*, Tb*, Fa*, Fb*, Ga*, Gb*)
-        save_3d_color_figure(
-            D1_RANGE, D3_RANGE, T_lab, F_lab, G_lab, mask, d2,
-            os.path.join(_OUTDIR_PNG, f"lowe_{tag}_3d_color.png"),
-        )
-
-        # ── Trend analysis report
-        print_trends_report(D1_RANGE, D3_RANGE, T_Y, T_lab, F_lab, G_lab, mask, d2)
-
-        all_summary_rows.append(dict(best))
-
-        print()
-
-    # ── Cross-Ag comparison
+    # ── Cross-experiment summary
     if all_summary_rows:
-        print("─" * 60)
-        print("Best design per Ag thickness:")
         summary = pd.DataFrame(all_summary_rows)
-        print(summary[["d2", "d1", "d3", "T_Y", "T_a", "T_b",
-                        "F_Y", "F_a", "F_b", "G_Y", "G_a", "G_b"]].to_string(index=False))
-        summary.to_csv(os.path.join(_OUTDIR_CSV, "lowe_best_per_Ag.csv"), index=False, float_format="%.4f")
-        print(f"\nSaved : {os.path.join(_OUTDIR_CSV, 'lowe_best_per_Ag.csv')}")
+        summary_path = os.path.join(_OUTDIR_CSV, "best_designs_all_experiments.csv")
+        summary.to_csv(summary_path, index=False, float_format="%.4f")
+        print(f"\nSummary saved : {summary_path}")
 
     print("\nDone.\n")
 
